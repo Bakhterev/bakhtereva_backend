@@ -4,3 +4,4 @@ caldav
 icalendar
 python-dotenv
 gunicorn
+requests
