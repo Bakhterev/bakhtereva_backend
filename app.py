@@ -9,6 +9,7 @@ import uuid
 import requests
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
+import pytz
 
 load_dotenv()
 
@@ -20,9 +21,15 @@ YANDEX_LOGIN = os.getenv('YANDEX_LOGIN')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 CALENDAR_ID = os.getenv('CALENDAR_ID', 'events-38315911')
 CALDAV_URL = "https://caldav.yandex.ru"
-WORK_START = 9   # 9:00
-WORK_END = 18    # 18:00
-SLOT_DURATION = 60  # минут
+
+# РАБОЧЕЕ ВРЕМЯ (ЕКАТЕРИНБУРГ)
+WORK_START_HOUR = 9   # 9:00 ЕКБ (UTC+5)
+WORK_END_HOUR = 18    # 18:00 ЕКБ (UTC+5)
+SLOT_DURATION = 60    # минут
+
+# Часовой пояс Екатеринбурга
+TZ = pytz.timezone('Asia/Yekaterinburg')
+UTC = timezone.utc
 
 def get_calendar():
     """Подключается к Яндекс.Календарю и возвращает объект календаря."""
@@ -36,14 +43,14 @@ def get_calendar():
         calendars = principal.calendars()
         for cal in calendars:
             if CALENDAR_ID in cal.id:
-                return cal, client, principal
+                return cal, client
         if calendars:
             print(f"⚠️ Календарь '{CALENDAR_ID}' не найден, использую первый: {calendars[0].id}")
-            return calendars[0], client, principal
-        return None, None, None
+            return calendars[0], client
+        return None, None
     except Exception as e:
         print(f"❌ Ошибка подключения: {e}")
-        return None, None, None
+        return None, None
 
 def fetch_event_data(event_url, login, password):
     """Скачивает содержимое события по URL с авторизацией."""
@@ -61,13 +68,12 @@ def fetch_event_data(event_url, login, password):
         return None
 
 def parse_ical_data(ical_str):
-    """Парсит iCalendar-строку и возвращает список событий."""
+    """Парсит iCalendar-строку и возвращает список событий с нормализованным временем."""
     if not ical_str:
         return []
     
     # Если строка содержит XML, извлекаем iCalendar
     if '<C:calendar-data>' in ical_str:
-        import re
         match = re.search(r'<C:calendar-data>(.*?)</C:calendar-data>', ical_str, re.DOTALL)
         if match:
             ical_str = match.group(1).strip()
@@ -80,6 +86,19 @@ def parse_ical_data(ical_str):
                 summary = component.get('summary', 'Без названия')
                 dtstart = component.get('dtstart').dt
                 dtend = component.get('dtend').dt
+                
+                # Приводим к екатеринбургскому времени (Asia/Yekaterinburg)
+                if dtstart.tzinfo is None:
+                    # Если время без часового пояса, предполагаем, что оно в Екатеринбурге
+                    dtstart = TZ.localize(dtstart)
+                else:
+                    dtstart = dtstart.astimezone(TZ)
+                
+                if dtend.tzinfo is None:
+                    dtend = TZ.localize(dtend)
+                else:
+                    dtend = dtend.astimezone(TZ)
+                
                 events.append({
                     'summary': str(summary),
                     'start': dtstart,
@@ -97,26 +116,27 @@ def get_free_slots():
         return jsonify({"error": "Дата не указана"}), 400
     
     try:
+        # Парсим дату в екатеринбургском времени
         date = datetime.strptime(date_str, '%Y-%m-%d').date()
     except ValueError:
         return jsonify({"error": "Неверный формат даты"}), 400
 
-    today = datetime.now().date()
+    today = datetime.now(TZ).date()
     if date < today:
         return jsonify({"error": "Нельзя выбрать прошедшую дату"}), 400
 
-    calendar_obj, client, principal = get_calendar()
+    calendar_obj, client = get_calendar()
     if not calendar_obj:
         return jsonify({"error": "Календарь не найден"}), 500
 
-    start_dt = datetime(date.year, date.month, date.day, 0, 0, 0, tzinfo=timezone.utc)
-    end_dt = datetime(date.year, date.month, date.day, 23, 59, 59, tzinfo=timezone.utc)
+    # Ищем события за день в UTC (Яндекс работает в UTC)
+    start_dt_utc = datetime(date.year, date.month, date.day, 0, 0, 0, tzinfo=UTC)
+    end_dt_utc = datetime(date.year, date.month, date.day, 23, 59, 59, tzinfo=UTC)
 
-    print(f"🔍 Поиск событий с {start_dt} по {end_dt}")
+    print(f"🔍 Поиск событий с {start_dt_utc} по {end_dt_utc} (UTC)")
 
     try:
-        # Получаем список событий (URL) за день
-        events = calendar_obj.date_search(start=start_dt, end=end_dt, expand=True)
+        events = calendar_obj.date_search(start=start_dt_utc, end=end_dt_utc, expand=True)
         print(f"📅 Найдено событий: {len(events)}")
     except Exception as e:
         print(f"❌ Ошибка поиска: {e}")
@@ -127,7 +147,6 @@ def get_free_slots():
     password = YANDEX_APP_PASSWORD
 
     for idx, event_item in enumerate(events):
-        # Извлекаем URL события
         event_url = None
         if hasattr(event_item, 'url'):
             event_url = event_item.url
@@ -135,33 +154,26 @@ def get_free_slots():
             event_url = event_item
         
         if not event_url:
-            print(f"⚠️ Событие {idx+1}: не удалось получить URL")
             continue
 
         print(f"📎 Событие {idx+1}: загрузка {event_url}")
         
-        # Скачиваем содержимое события
         ical_data = fetch_event_data(event_url, login, password)
         if not ical_data:
             continue
 
-        # Парсим iCalendar
         parsed_events = parse_ical_data(ical_data)
         for ev in parsed_events:
-            # Приводим время к UTC
+            # Время уже в екатеринбургском
             start = ev['start']
             end = ev['end']
-            if start.tzinfo is None:
-                start = start.replace(tzinfo=timezone.utc)
-            if end.tzinfo is None:
-                end = end.replace(tzinfo=timezone.utc)
             busy.append((start, end))
-            print(f"   Занято: {start} – {end}")
+            print(f"   Занято (ЕКБ): {start.strftime('%H:%M')} – {end.strftime('%H:%M')}")
 
-    # Генерируем свободные слоты
+    # Генерируем свободные слоты в екатеринбургском времени
     slots = []
-    start_slot = datetime(date.year, date.month, date.day, WORK_START, 0, 0, tzinfo=timezone.utc)
-    end_slot = datetime(date.year, date.month, date.day, WORK_END, 0, 0, tzinfo=timezone.utc)
+    start_slot = datetime(date.year, date.month, date.day, WORK_START_HOUR, 0, 0, tzinfo=TZ)
+    end_slot = datetime(date.year, date.month, date.day, WORK_END_HOUR, 0, 0, tzinfo=TZ)
     
     current = start_slot
     while current + timedelta(minutes=SLOT_DURATION) <= end_slot:
@@ -176,7 +188,8 @@ def get_free_slots():
             slots.append(slot_start.strftime('%H:%M'))
         current += timedelta(minutes=SLOT_DURATION)
 
-    print(f"✅ Свободных слотов: {len(slots)}")
+    print(f"✅ Свободных слотов (ЕКБ): {len(slots)}")
+    print(f"   Слоты: {slots}")
     return jsonify(slots)
 
 @app.route('/book', methods=['POST'])
@@ -191,19 +204,25 @@ def book_appointment():
         return jsonify({"error": "Не хватает данных"}), 400
 
     try:
-        start_time = datetime.fromisoformat(start_time_str).astimezone(timezone.utc)
+        # Парсим время в екатеринбургском часовом поясе
+        start_time = datetime.fromisoformat(start_time_str)
+        if start_time.tzinfo is None:
+            start_time = TZ.localize(start_time)
+        else:
+            start_time = start_time.astimezone(TZ)
+        
         end_time = start_time + timedelta(minutes=SLOT_DURATION)
 
-        calendar_obj, client, principal = get_calendar()
+        calendar_obj, client = get_calendar()
         if not calendar_obj:
             return jsonify({"error": "Календарь не найден"}), 500
 
-        # Проверяем занятость (снова, как в /slots)
+        # Проверяем занятость
         date = start_time.date()
-        start_dt = datetime(date.year, date.month, date.day, 0, 0, 0, tzinfo=timezone.utc)
-        end_dt = datetime(date.year, date.month, date.day, 23, 59, 59, tzinfo=timezone.utc)
+        start_dt_utc = datetime(date.year, date.month, date.day, 0, 0, 0, tzinfo=UTC)
+        end_dt_utc = datetime(date.year, date.month, date.day, 23, 59, 59, tzinfo=UTC)
 
-        events = calendar_obj.date_search(start=start_dt, end=end_dt, expand=True)
+        events = calendar_obj.date_search(start=start_dt_utc, end=end_dt_utc, expand=True)
         login = YANDEX_LOGIN
         password = YANDEX_APP_PASSWORD
 
@@ -222,25 +241,26 @@ def book_appointment():
             
             parsed_events = parse_ical_data(ical_data)
             for ev in parsed_events:
-                start = ev['start']
-                end = ev['end']
-                if start.tzinfo is None:
-                    start = start.replace(tzinfo=timezone.utc)
-                if end.tzinfo is None:
-                    end = end.replace(tzinfo=timezone.utc)
-                if not (end_time <= start or start_time >= end):
+                busy_start = ev['start']
+                busy_end = ev['end']
+                # Проверяем пересечение в екатеринбургском времени
+                if not (end_time <= busy_start or start_time >= busy_end):
                     return jsonify({"error": "Это время уже занято"}), 409
 
-        # Создаём событие в календаре
+        # Создаём событие в календаре (в UTC)
+        # Конвертируем екатеринбургское время в UTC для сохранения
+        start_utc = start_time.astimezone(UTC)
+        end_utc = end_time.astimezone(UTC)
+
         cal = Calendar()
         cal.add('prodid', '-//My Calendar//')
         cal.add('version', '2.0')
 
         event = Event()
         event.add('uid', str(uuid.uuid4()))
-        event.add('dtstamp', datetime.now(timezone.utc))
-        event.add('dtstart', start_time)
-        event.add('dtend', end_time)
+        event.add('dtstamp', datetime.now(UTC))
+        event.add('dtstart', start_utc)
+        event.add('dtend', end_utc)
         event.add('summary', f'Консультация: {patient_name}')
         event.add('description', f'Телефон: {patient_phone}\nEmail: {patient_email or "Не указан"}')
         event.add('location', 'г. Екатеринбург, ул. Примерная, д. 1 (или онлайн)')
