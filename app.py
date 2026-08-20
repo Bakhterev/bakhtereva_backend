@@ -12,42 +12,63 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-
+# --- КОНФИГУРАЦИЯ ---
 YANDEX_LOGIN = os.getenv('YANDEX_LOGIN')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
-CALENDAR_ID = os.getenv('CALENDAR_ID', 'events-default')
+CALENDAR_ID = os.getenv('CALENDAR_ID', 'events-38315911')
 CALDAV_URL = "https://caldav.yandex.ru"
 WORK_START = 9   # 9:00
 WORK_END = 18    # 18:00
 SLOT_DURATION = 60  # минут
 
 def get_calendar():
-    """Подключается к Яндекс.Календарю и возвращает объект календаря."""
-    client = DAVClient(
-        url=CALDAV_URL,
-        username=YANDEX_LOGIN,
-        password=YANDEX_APP_PASSWORD
-    )
-    principal = client.principal()
-    calendars = principal.calendars()
-    for cal in calendars:
-        if CALENDAR_ID in cal.id:
-            return cal
-    return None
+    try:
+        client = DAVClient(
+            url=CALDAV_URL,
+            username=YANDEX_LOGIN,
+            password=YANDEX_APP_PASSWORD
+        )
+        principal = client.principal()
+        calendars = principal.calendars()
+        for cal in calendars:
+            if CALENDAR_ID in cal.id:
+                return cal
+        if calendars:
+            print(f"⚠️ Календарь '{CALENDAR_ID}' не найден, использую первый: {calendars[0].id}")
+            return calendars[0]
+        return None
+    except Exception as e:
+        print(f"❌ Ошибка подключения: {e}")
+        return None
 
-def get_busy_slots(date):
-    """Возвращает список занятых интервалов для указанной даты."""
+@app.route('/slots', methods=['GET'])
+def get_free_slots():
+    date_str = request.args.get('date')
+    if not date_str:
+        return jsonify({"error": "Дата не указана"}), 400
+    try:
+        date = datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({"error": "Неверный формат даты"}), 400
+
+    today = datetime.now().date()
+    if date < today:
+        return jsonify({"error": "Нельзя выбрать прошедшую дату"}), 400
+
     calendar_obj = get_calendar()
     if not calendar_obj:
-        return []
+        return jsonify({"error": "Календарь не найден"}), 500
 
     start_dt = datetime(date.year, date.month, date.day, 0, 0, 0, tzinfo=timezone.utc)
     end_dt = datetime(date.year, date.month, date.day, 23, 59, 59, tzinfo=timezone.utc)
-    events = calendar_obj.date_search(
-        start=start_dt,
-        end=end_dt,
-        expand=True
-    )
+
+    try:
+        events = calendar_obj.date_search(start=start_dt, end=end_dt, expand=True)
+    except Exception as e:
+        print(f"❌ Ошибка поиска: {e}")
+        return jsonify({"error": f"Ошибка получения событий: {str(e)}"}), 500
+
+    # Парсим события
     busy = []
     for event_data in events:
         try:
@@ -61,26 +82,9 @@ def get_busy_slots(date):
                     if dtend.tzinfo is None:
                         dtend = dtend.replace(tzinfo=timezone.utc)
                     busy.append((dtstart, dtend))
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ Ошибка парсинга события: {e}")
             continue
-    return busy
-
-@app.route('/slots', methods=['GET'])
-def get_free_slots():
-    """Возвращает список свободных временных слотов для указанной даты."""
-    date_str = request.args.get('date')
-    if not date_str:
-        return jsonify({"error": "Дата не указана"}), 400
-    try:
-        date = datetime.strptime(date_str, '%Y-%m-%d').date()
-    except ValueError:
-        return jsonify({"error": "Неверный формат даты"}), 400
-
-    today = datetime.now().date()
-    if date < today:
-        return jsonify({"error": "Нельзя выбрать прошедшую дату"}), 400
-
-    busy = get_busy_slots(date)
 
     slots = []
     start_dt = datetime(date.year, date.month, date.day, WORK_START, 0, 0, tzinfo=timezone.utc)
@@ -112,14 +116,33 @@ def book_appointment():
         return jsonify({"error": "Не хватает данных"}), 400
 
     try:
-        start_time = datetime.fromisoformat(start_time_str)
+        start_time = datetime.fromisoformat(start_time_str).astimezone(timezone.utc)
         end_time = start_time + timedelta(minutes=SLOT_DURATION)
 
+        calendar_obj = get_calendar()
+        if not calendar_obj:
+            return jsonify({"error": "Календарь не найден"}), 500
+
         date = start_time.date()
-        busy = get_busy_slots(date)
-        for busy_start, busy_end in busy:
-            if not (end_time <= busy_start or start_time >= busy_end):
-                return jsonify({"error": "Это время уже занято"}), 409
+        start_dt = datetime(date.year, date.month, date.day, 0, 0, 0, tzinfo=timezone.utc)
+        end_dt = datetime(date.year, date.month, date.day, 23, 59, 59, tzinfo=timezone.utc)
+
+        events = calendar_obj.date_search(start=start_dt, end=end_dt, expand=True)
+        for event_data in events:
+            try:
+                cal = Calendar.from_ical(event_data)
+                for component in cal.walk():
+                    if component.name == "VEVENT":
+                        dtstart = component.get('dtstart').dt
+                        dtend = component.get('dtend').dt
+                        if dtstart.tzinfo is None:
+                            dtstart = dtstart.replace(tzinfo=timezone.utc)
+                        if dtend.tzinfo is None:
+                            dtend = dtend.replace(tzinfo=timezone.utc)
+                        if not (end_time <= dtstart or start_time >= dtend):
+                            return jsonify({"error": "Это время уже занято"}), 409
+            except Exception:
+                continue
 
         cal = Calendar()
         cal.add('prodid', '-//My Calendar//')
@@ -137,18 +160,14 @@ def book_appointment():
         cal.add_component(event)
         ics_data = cal.to_ical().decode('utf-8')
 
-        calendar_obj = get_calendar()
-        if not calendar_obj:
-            return jsonify({"error": "Не удалось найти календарь"}), 500
-
         calendar_obj.save_event(ics_data)
 
         return jsonify({"success": True, "message": "Запись успешно создана!"}), 200
 
     except Exception as e:
-        print(f"Ошибка: {e}")
+        print(f"❌ Ошибка: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(debug=False, host='0.0.0.0', port=port)
