@@ -98,6 +98,9 @@ def parse_ical_data(ical_str):
 def get_free_slots():
     date_str = request.args.get('date')
     consultation_type = request.args.get('consultation_type', 'online')
+    
+    print(f"📥 /slots запрос: date={date_str}, consultation_type={consultation_type}")
+    
     if not date_str:
         return jsonify({"error": "Дата не указана"}), 400
     try:
@@ -110,21 +113,24 @@ def get_free_slots():
         return jsonify({"error": "Нельзя выбрать прошедшую дату"}), 400
 
     weekday = date.weekday()  # 0-пн, 6-вс
+    print(f"📅 День недели: {weekday} (0-пн, 6-вс)")
 
     # Генерируем слоты в зависимости от типа и дня
     slots = []
     if consultation_type == 'online':
         if weekday == 6:  # воскресенье
             slots = ['18:00', '19:00']
+            print("🟢 Онлайн: добавлены слоты 18:00, 19:00")
         else:
-            slots = []
+            print("🔴 Онлайн: сегодня не воскресенье, слотов нет")
     elif consultation_type == 'offline':
         if weekday == 0:  # понедельник
             slots = ['17:30', '18:30']
+            print("🟢 Офлайн: добавлены слоты 17:30, 18:30")
         else:
-            slots = []
+            print("🔴 Офлайн: сегодня не понедельник, слотов нет")
     else:
-        slots = []
+        print(f"⚠️ Неизвестный тип консультации: {consultation_type}")
 
     # Если сегодня, убираем прошедшие слоты
     if date == today:
@@ -139,10 +145,12 @@ def get_free_slots():
             except:
                 continue
         slots = slots_filtered
+        print(f"⏳ Сегодня, после фильтрации прошедших: {slots}")
 
     # Проверка занятости из календаря
     calendar_obj, client = get_calendar()
     if not calendar_obj:
+        print("❌ Календарь не найден")
         return jsonify({"error": "Календарь не найден"}), 500
 
     start_dt_utc = datetime(date.year, date.month, date.day, 0, 0, 0, tzinfo=UTC)
@@ -150,15 +158,16 @@ def get_free_slots():
 
     try:
         events = calendar_obj.date_search(start=start_dt_utc, end=end_dt_utc, expand=True)
+        print(f"📚 Найдено событий в календаре: {len(events)}")
     except Exception as e:
-        print(f"Ошибка поиска: {e}")
+        print(f"❌ Ошибка поиска: {e}")
         return jsonify({"error": f"Ошибка получения событий: {str(e)}"}), 500
 
     busy = []
     login = YANDEX_LOGIN
     password = YANDEX_APP_PASSWORD
 
-    for event_item in events:
+    for idx, event_item in enumerate(events):
         event_url = None
         if hasattr(event_item, 'url'):
             event_url = event_item.url
@@ -172,12 +181,13 @@ def get_free_slots():
         parsed_events = parse_ical_data(ical_data)
         for ev in parsed_events:
             busy.append((ev['start'], ev['end']))
+    print(f"🚫 Занятые интервалы: {[(b[0].strftime('%H:%M'), b[1].strftime('%H:%M')) for b in busy]}")
 
     free_slots = []
+    duration_minutes = 40 if consultation_type == 'online' else 60
     for slot in slots:
         slot_time = datetime.strptime(slot, '%H:%M').time()
         slot_start = datetime(date.year, date.month, date.day, slot_time.hour, slot_time.minute, tzinfo=TZ)
-        duration_minutes = 40 if consultation_type == 'online' else 60
         slot_end = slot_start + timedelta(minutes=duration_minutes)
         is_free = True
         for busy_start, busy_end in busy:
@@ -186,7 +196,8 @@ def get_free_slots():
                 break
         if is_free:
             free_slots.append(slot)
-
+    
+    print(f"✅ Свободные слоты: {free_slots}")
     return jsonify(free_slots)
 
 @app.route('/book', methods=['POST'])
