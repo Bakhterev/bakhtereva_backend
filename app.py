@@ -254,7 +254,7 @@ def book_appointment():
                 'Ссылка на встречу будет отправлена отдельно.'
             )
         else:
-            location = 'г. Екатеринбург, ул. Примерная, д. 1 (очно)'
+            location = 'г. Екатеринбург, ул. Хохрякова, д. 72А (очно)'
             description = f'Телефон: {patient_phone}\nEmail: {patient_email or "Не указан"}'
 
         cal = Calendar()
